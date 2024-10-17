@@ -1,0 +1,236 @@
+import tkinter as tk
+import pandas as pd
+import numpy as np
+import asyncio
+import time
+from threading import Thread
+from quotexapi.stable_api import Quotex
+from datetime import datetime, timedelta
+
+# Configuração do cliente Quotex
+client = None
+ultimo_sinal = {}  # Dicionário para rastrear o tempo do último sinal para cada par
+
+async def conectar(email, senha, user_data_dir):
+    global client
+    client = Quotex(
+        email=email,
+        password=senha,
+        lang="pt",
+        user_data_dir=user_data_dir
+    )
+    client.debug_ws_enable = False
+    try:
+        check_connect, message = await client.connect()
+        if not check_connect:
+            atualizar_status(f"Erro ao conectar: {message}")
+            return False
+        atualizar_status("Conectado com sucesso.")
+        botao_iniciar.config(state=tk.NORMAL)  # Habilitar o botão de iniciar análise
+        return True
+    except Exception as e:
+        atualizar_status(f"Erro ao conectar: {e}")
+        return False
+
+def calcular_adx(high, low, close, n=14):
+    df = pd.DataFrame({'High': high, 'Low': low, 'Close': close})
+    df['TR'] = np.maximum((df['High'] - df['Low']), np.maximum(abs(df['High'] - df['Close'].shift()), abs(df['Low'] - df['Close'].shift())))
+    df['+DM'] = np.where((df['High'] - df['High'].shift()) > (df['Low'].shift() - df['Low']), df['High'] - df['High'].shift(), 0)
+    df['-DM'] = np.where((df['Low'].shift() - df['Low']) > (df['High'] - df['High'].shift()), df['Low'].shift() - df['Low'], 0)
+    df['+DI'] = 100 * (df['+DM'].ewm(alpha=1/n, min_periods=n).mean() / df['TR'].ewm(alpha=1/n, min_periods=n).mean())
+    df['-DI'] = 100 * (df['-DM'].ewm(alpha=1/n, min_periods=n).mean() / df['TR'].ewm(alpha=1/n, min_periods=n).mean())
+    df['DX'] = (abs(df['+DI'] - df['-DI']) / abs(df['+DI'] + df['-DI'])) * 100
+    adx = df['DX'].ewm(alpha=1/n, min_periods=n).mean()
+    return adx
+
+def calcular_macd(close_prices):
+    ema_12 = pd.Series(close_prices).ewm(span=12, adjust=False).mean()
+    ema_26 = pd.Series(close_prices).ewm(span=26, adjust=False).mean()
+    macd_line = ema_12 - ema_26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    return macd_line, signal_line
+
+def calcular_rsi(close_prices, n=14):
+    delta = pd.Series(close_prices).diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=n).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=n).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def identificar_padroes_de_velas(open_prices, high_prices, low_prices, close_prices):
+    padroes = []
+    for i in range(1, len(close_prices)):
+        # Martelo: corpo pequeno, sombra inferior longa
+        if close_prices[i] > open_prices[i] and (high_prices[i] - close_prices[i]) < (close_prices[i] - low_prices[i]) * 0.3:
+            padroes.append('hammer')
+        # Estrela Cadente: corpo pequeno, sombra superior longa
+        elif open_prices[i] > close_prices[i] and (close_prices[i] - low_prices[i]) < (high_prices[i] - close_prices[i]) * 0.3:
+            padroes.append('shooting_star')
+        else:
+            padroes.append(None)
+    return padroes
+
+def calcular_suporte_resistencia(high_prices, low_prices, close_prices, window=14):
+    suporte = []
+    resistencia = []
+    for i in range(window, len(close_prices)):
+        suporte.append(min(low_prices[i-window:i]))
+        resistencia.append(max(high_prices[i-window:i]))
+    return suporte, resistencia
+
+async def realizar_analise_tecnica(asset):
+    try:
+        print(f"Obtendo candles para {asset}...")
+        candles = await client.get_candles(asset, time.time(), 172800, 300)  # 2 dias de dados, timeframe de 5 minutos
+        if not candles or 'data' not in candles or len(candles['data']) < 50:
+            print(f"Dados insuficientes para {asset}. Tentando novamente em breve...")
+            return None
+
+        close_prices = [c['close'] for c in candles['data']]
+        open_prices = [c['open'] for c in candles['data']]
+        high_prices = [c['high'] for c in candles['data']]
+        low_prices = [c['low'] for c in candles['data']]
+
+        # Calcular EMA
+        ema_21 = pd.Series(close_prices).ewm(span=21, adjust=False).mean()
+        ema_50 = pd.Series(close_prices).ewm(span=50, adjust=False).mean()
+
+        # Calcular ADX
+        adx = calcular_adx(high_prices, low_prices, close_prices)
+
+        # Calcular RSI
+        rsi = calcular_rsi(close_prices)
+
+        # Calcular MACD
+        macd_line, signal_line = calcular_macd(close_prices)
+
+        # Identificar padrões de velas
+        padroes = identificar_padroes_de_velas(open_prices, high_prices, low_prices, close_prices)
+
+        # Calcular suporte e resistência
+        suporte, resistencia = calcular_suporte_resistencia(high_prices, low_prices, close_prices)
+
+        # Estratégia de Compra/Venda com Filtros Adicionais
+        if (close_prices[-1] > ema_21.iloc[-1] and close_prices[-1] > ema_50.iloc[-1] and adx.iloc[-1] > 25 and
+            rsi.iloc[-1] < 70 and macd_line.iloc[-1] > signal_line.iloc[-1] and close_prices[-1] > suporte[-1]):
+            return 'call', "Preço acima das EMAs, ADX indica tendência forte, RSI não está em sobrecompra, MACD acima da linha de sinal, e acima do suporte."
+        elif (close_prices[-1] < ema_21.iloc[-1] and close_prices[-1] < ema_50.iloc[-1] and adx.iloc[-1] > 25 and
+              rsi.iloc[-1] > 30 and macd_line.iloc[-1] < signal_line.iloc[-1] and close_prices[-1] < resistencia[-1]):
+            return 'put', "Preço abaixo das EMAs, ADX indica tendência forte, RSI não está em sobrevenda, MACD abaixo da linha de sinal, e abaixo da resistência."
+        elif padroes[-1] == 'hammer' and close_prices[-1] > suporte[-1]:
+            return 'call', "Padrão de Martelo identificado, possível reversão de alta acima do suporte."
+        elif padroes[-1] == 'shooting_star' and close_prices[-1] < resistencia[-1]:
+            return 'put', "Padrão de Estrela Cadente identificado, possível reversão de baixa abaixo da resistência."
+        else:
+            return None, "Sem sinal claro."
+    except Exception as e:
+        print(f"Erro na análise técnica para {asset}: {e}")
+        return None
+
+async def analisar_pares():
+    while rodando:
+        try:
+            ativos_abertos = client.get_all_asset_name()
+            if not ativos_abertos:
+                atualizar_status("Erro ao obter a lista de ativos.")
+                return
+
+            for ativo in ativos_abertos:
+                if not rodando:
+                    break
+                if "S&P/ASX 200" in ativo[1]:  # Ignorar o par S&P/ASX 200
+                    continue
+                if "/" in ativo[1]:  # Verifica se o nome do ativo contém "/"
+                    # Verificar se o par foi sinalizado nos últimos 10 minutos
+                    if ativo[1] in ultimo_sinal and (datetime.now() - ultimo_sinal[ativo[1]]).total_seconds() < 600:
+                        continue
+
+                    atualizar_status(f"Analisando o par: {ativo[1]}")
+                    sinal, explicacao = await realizar_analise_tecnica(ativo[0])
+                    if sinal:
+                        hora_entrada = datetime.now() + timedelta(minutes=1)  # Entrada com 1 minuto de antecedência
+                        expiracao = "1 minuto"  # Exemplo de expiração
+                        resultado = (f"\n{'-'*40}\n"
+                                     f"Par: {ativo[1]}\n"
+                                     f"Sinal: {sinal.upper()}\n"
+                                     f"Explicação: {explicacao}\n"
+                                     f"Entrada: {hora_entrada.strftime('%H:%M:%S')}\n"
+                                     f"Expiração: {expiracao}\n"
+                                     f"{'-'*40}\n")
+                        atualizar_dashboard(resultado)
+                        ultimo_sinal[ativo[1]] = datetime.now()  # Atualizar o tempo do último sinal
+                        time.sleep(60)  # Pausa de 1 minuto após cada sinal
+        except Exception as e:
+            atualizar_status(f"Erro ao analisar pares: {e}")
+
+# Atualizar o dashboard com o resultado da análise
+def atualizar_dashboard(resultado):
+    text_resultado.config(state=tk.NORMAL)
+    text_resultado.insert(tk.END, resultado + "\n")
+    text_resultado.config(state=tk.DISABLED)
+    text_resultado.see(tk.END)
+
+# Atualizar o status do par sendo analisado
+def atualizar_status(status):
+    label_status.config(text=status)
+
+# Função para fazer login
+def login():
+    email = email_entry.get()
+    senha = senha_entry.get()
+    user_data_dir = "caminho/para/o/perfil"
+    asyncio.run(conectar(email, senha, user_data_dir))
+
+# Iniciar a análise em uma thread separada
+def iniciar_analise():
+    global rodando
+    rodando = True
+    botao_iniciar.config(state=tk.DISABLED)
+    botao_parar.config(state=tk.NORMAL)
+    thread_analise = Thread(target=lambda: asyncio.run(analisar_pares()))
+    thread_analise.start()
+
+# Parar a análise
+def parar_analise():
+    global rodando
+    rodando = False
+    atualizar_status("Status: Parado")
+    botao_iniciar.config(state=tk.NORMAL)
+    botao_parar.config(state=tk.DISABLED)
+
+# Configuração do dashboard
+root = tk.Tk()
+root.title("Dashboard de Análise Técnica")
+root.geometry("800x600")
+root.configure(bg="#34495e")
+
+label_titulo = tk.Label(root, text="Análise Técnica de Mercado", font=("Helvetica", 20, "bold"), bg="#34495e", fg="white")
+label_titulo.pack(pady=20)
+
+# Campos de entrada para e-mail e senha
+email_label = tk.Label(root, text="E-mail:", font=("Helvetica", 12), bg="#34495e", fg="white")
+email_label.pack()
+email_entry = tk.Entry(root, width=30, font=("Helvetica", 12))
+email_entry.pack(pady=5)
+
+senha_label = tk.Label(root, text="Senha:", font=("Helvetica", 12), bg="#34495e", fg="white")
+senha_label.pack()
+senha_entry = tk.Entry(root, show="*", width=30, font=("Helvetica", 12))
+senha_entry.pack(pady=5)
+
+botao_login = tk.Button(root, text="Login", command=login, bg="#2980b9", fg="white", font=("Helvetica", 14), width=15)
+botao_login.pack(pady=10)
+
+label_status = tk.Label(root, text="Status: Aguardando...", font=("Helvetica", 14), bg="#34495e", fg="white")
+label_status.pack(pady=10)
+
+text_resultado = tk.Text(root, height=15, width=80, state=tk.DISABLED, bg="#ecf0f1", font=("Helvetica", 12))
+text_resultado.pack(pady=20)
+
+botao_iniciar = tk.Button(root, text="Iniciar Análise", command=iniciar_analise, bg="#27ae60", fg="white", font=("Helvetica", 14), width=15, state=tk.DISABLED)
+botao_iniciar.pack(side=tk.LEFT, padx=20)
+
+botao_parar = tk.Button(root, text="Parar Análise", command=parar_analise, bg="#c0392b", fg="white", font=("Helvetica", 14), width=15, state=tk.DISABLED)
+botao_parar.pack(side=tk.RIGHT, padx=20)
+
+root.mainloop()
